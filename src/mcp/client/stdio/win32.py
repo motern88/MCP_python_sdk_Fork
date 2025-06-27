@@ -16,57 +16,50 @@ from anyio.streams.file import FileReadStream, FileWriteStream
 
 def get_windows_executable_command(command: str) -> str:
     """
-    Get the correct executable command normalized for Windows.
+    获取适用于 Windows 系统的可执行命令路径。
 
-    On Windows, commands might exist with specific extensions (.exe, .cmd, etc.)
-    that need to be located for proper execution.
-
-    Args:
-        command: Base command (e.g., 'uvx', 'npx')
-
-    Returns:
-        str: Windows-appropriate command path
+    在 Windows 上，命令可能有扩展名（.exe, .cmd 等），
+    需要查找完整路径才能正确执行。
     """
     try:
-        # First check if command exists in PATH as-is
+        # 先尝试直接查找该命令是否已在 PATH 中
         if command_path := shutil.which(command):
             return command_path
 
-        # Check for Windows-specific extensions
+        # 尝试添加常见的 Windows 扩展名进行查找
         for ext in [".cmd", ".bat", ".exe", ".ps1"]:
             ext_version = f"{command}{ext}"
             if ext_path := shutil.which(ext_version):
                 return ext_path
 
-        # For regular commands or if we couldn't find special versions
+        # 若都找不到，就返回原始命令（可能后续处理）
         return command
     except OSError:
-        # Handle file system errors during path resolution
-        # (permissions, broken symlinks, etc.)
+        # 如果查找过程中发生文件系统错误（例如权限问题）
         return command
 
 
 class FallbackProcess:
     """
-    A fallback process wrapper for Windows to handle async I/O
-    when using subprocess.Popen, which provides sync-only FileIO objects.
+    Windows 平台上 subprocess.Popen 的异步封装器。
 
-    This wraps stdin and stdout into async-compatible
-    streams (FileReadStream, FileWriteStream),
-    so that MCP clients expecting async streams can work properly.
+    由于 subprocess 的 stdin/stdout 是同步 FileIO 对象，
+    MCP 需要异步流支持，因此此类将其包装为异步流。
     """
 
     def __init__(self, popen_obj: subprocess.Popen[bytes]):
         self.popen: subprocess.Popen[bytes] = popen_obj
-        self.stdin_raw = popen_obj.stdin  # type: ignore[assignment]
-        self.stdout_raw = popen_obj.stdout  # type: ignore[assignment]
-        self.stderr = popen_obj.stderr  # type: ignore[assignment]
+        self.stdin_raw = popen_obj.stdin  # 原始同步输入流
+        self.stdout_raw = popen_obj.stdout  # 原始同步输出流
+        self.stderr = popen_obj.stderr  # 错误输出
 
+        # 包装成异步写入流
         self.stdin = FileWriteStream(cast(BinaryIO, self.stdin_raw)) if self.stdin_raw else None
+        # 包装成异步读取流
         self.stdout = FileReadStream(cast(BinaryIO, self.stdout_raw)) if self.stdout_raw else None
 
     async def __aenter__(self):
-        """Support async context manager entry."""
+        """支持异步上下文管理器入口"""
         return self
 
     async def __aexit__(
@@ -75,11 +68,11 @@ class FallbackProcess:
         exc_val: BaseException | None,
         exc_tb: object | None,
     ) -> None:
-        """Terminate and wait on process exit inside a thread."""
+        """退出上下文时终止进程并清理资源"""
         self.popen.terminate()
-        await to_thread.run_sync(self.popen.wait)
+        await to_thread.run_sync(self.popen.wait)  # 阻塞等待在子线程中完成
 
-        # Close the file handles to prevent ResourceWarning
+        # 关闭文件句柄
         if self.stdin:
             await self.stdin.aclose()
         if self.stdout:
@@ -92,15 +85,15 @@ class FallbackProcess:
             self.stderr.close()
 
     async def wait(self):
-        """Async wait for process completion."""
+        """异步等待子进程结束"""
         return await to_thread.run_sync(self.popen.wait)
 
     def terminate(self):
-        """Terminate the subprocess immediately."""
+        """立即终止子进程"""
         return self.popen.terminate()
 
     def kill(self) -> None:
-        """Kill the subprocess immediately (alias for terminate)."""
+        """强制杀死子进程（等价于 terminate）"""
         self.terminate()
 
 
@@ -117,24 +110,23 @@ async def create_windows_process(
     cwd: Path | str | None = None,
 ) -> FallbackProcess:
     """
-    Creates a subprocess in a Windows-compatible way.
+    在 Windows 上创建异步兼容的子进程。
 
-    On Windows, asyncio.create_subprocess_exec has incomplete support
-    (NotImplementedError when trying to open subprocesses).
-    Therefore, we fallback to subprocess.Popen and wrap it for async usage.
+    由于 asyncio.create_subprocess_exec 在 Windows 下不完全支持，
+    所以使用 subprocess.Popen，并使用 FallbackProcess 异步封装。
 
-    Args:
-        command (str): The executable to run
-        args (list[str]): List of command line arguments
-        env (dict[str, str] | None): Environment variables
-        errlog (TextIO | None): Where to send stderr output (defaults to sys.stderr)
-        cwd (Path | str | None): Working directory for the subprocess
+    参数：
+        command：命令可执行文件
+        args：命令参数列表
+        env：环境变量
+        errlog：标准错误输出流
+        cwd：工作目录
 
-    Returns:
-        FallbackProcess: Async-compatible subprocess with stdin and stdout streams
+    返回：
+        FallbackProcess：包装后的异步子进程
     """
     try:
-        # Try launching with creationflags to avoid opening a new console window
+        # 优先尝试使用 creationflags，防止打开新控制台窗口
         popen_obj = subprocess.Popen(
             [command, *args],
             stdin=subprocess.PIPE,
@@ -142,13 +134,13 @@ async def create_windows_process(
             stderr=errlog,
             env=env,
             cwd=cwd,
-            bufsize=0,  # Unbuffered output
+            bufsize=0,  # 不缓冲输出
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return FallbackProcess(popen_obj)
 
     except Exception:
-        # If creationflags failed, fallback without them
+        # 如果设置 creationflags 报错，则不使用它重试
         popen_obj = subprocess.Popen(
             [command, *args],
             stdin=subprocess.PIPE,
@@ -163,20 +155,15 @@ async def create_windows_process(
 
 async def terminate_windows_process(process: Process | FallbackProcess):
     """
-    Terminate a Windows process.
+    终止一个 Windows 子进程。
 
-    Note: On Windows, terminating a process with process.terminate() doesn't
-    always guarantee immediate process termination.
-    So we give it 2s to exit, or we call process.kill()
-    which sends a SIGKILL equivalent signal.
-
-    Args:
-        process: The process to terminate
+    注意：在 Windows 上调用 process.terminate() 不总是立即生效，
+    所以给它最多 2 秒时间退出，若未退出则调用 kill 强制终止。
     """
     try:
         process.terminate()
         with anyio.fail_after(2.0):
             await process.wait()
     except TimeoutError:
-        # Force kill if it doesn't terminate
+        # 超时未退出则强制杀死进程
         process.kill()
